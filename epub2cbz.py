@@ -7,7 +7,7 @@ CBZ/CBR/CB7 ⇄ EPUB 2.0 双向转换工具 (兼容 Sigil)
 特性:
 - EPUB: 封面 cover.xhtml + cover.xxx, 内页 page_0001.xhtml + image_0001.xxx
 - 自定义 CSS（含 @page、div.page-container、img.page-img）
-- CBZ: 封面保持原名，其余图片按页面顺序重命名为 image_0001.xxx 起始
+- CBZ: 智能识别封面并保持原名，其余图片按页面顺序重命名为 image_0001.xxx 起始
 - EPUB 与 CBZ 均采用最大兼容压缩 (ZIP_DEFLATED, compresslevel=9)，EPUB 的 mimetype 除外
 - OPF 与 NCX 采用字符串模板生成，确保 100% 完美 Sigil 风格缩进
 - 支持拖放批量转换
@@ -308,7 +308,7 @@ img.page-img {
 
 # ---------- CBZ 生成 ----------
 def epub_to_cbz(epub_path):
-    """从 EPUB 提取图片，按页面顺序重命名，封面保留原名，其余 image_0001.xxx 起始，CBZ 使用最大 deflate 压缩"""
+    """从 EPUB 提取图片，智能识别封面并置顶，其余按页面顺序重命名，CBZ 使用最大 deflate 压缩"""
     in_path = Path(epub_path)
     if not in_path.exists():
         print(f"文件不存在: {epub_path}")
@@ -356,9 +356,11 @@ def epub_to_cbz(epub_path):
             mtype = item.get('media-type')
             manifest[mid] = {'href': href, 'media-type': mtype}
             
-        # 确定封面图片
+        # 智能识别封面图片
         cover_img_href = None
         metadata = opf_root.find(f'{{{ns_opf}}}metadata')
+        
+        # 1. 优先通过 metadata 中的 <meta name="cover"> 识别
         if metadata is not None:
             for meta_elem in metadata.findall(f'{{{ns_opf}}}meta'):
                 if meta_elem.get('name') == 'cover':
@@ -367,7 +369,15 @@ def epub_to_cbz(epub_path):
                         cover_img_href = manifest[cover_id]['href']
                     break
                     
-        # 按 spine 顺序获取页面
+        # 2. 如果没找到，遍历 manifest 寻找文件名包含 "cover" 的图片
+        if not cover_img_href:
+            for mid, info in manifest.items():
+                if info['media-type'].startswith('image/'):
+                    if 'cover' in os.path.basename(info['href']).lower():
+                        cover_img_href = info['href']
+                        break
+
+        # 按 spine 顺序获取页面，提取图片 src
         spine = opf_root.find(f'{{{ns_opf}}}spine')
         if spine is None:
             print("OPF 缺少 spine")
@@ -399,7 +409,8 @@ def epub_to_cbz(epub_path):
                         xhtml_dir = os.path.dirname(xhtml_abs)
                         img_abs = os.path.normpath(os.path.join(xhtml_dir, src))
                         if os.path.exists(img_abs):
-                            img_href = os.path.relpath(img_abs, os.path.join(tmp, opf_dir))
+                            # 修复跨平台路径分隔符问题，确保与 manifest 中的 href 完美匹配
+                            img_href = os.path.relpath(img_abs, os.path.join(tmp, opf_dir)).replace('\\', '/')
                             ordered_images.append((img_abs, img_href))
             except Exception:
                 continue
@@ -422,13 +433,13 @@ def epub_to_cbz(epub_path):
             else:
                 other_imgs.append((img_abs, img_href))
                 
-        if not cover_img and other_imgs:
-            for i, (img_abs, img_href) in enumerate(other_imgs):
-                if 'cover' in os.path.basename(img_href).lower():
-                    cover_img = (img_abs, img_href)
-                    del other_imgs[i]
-                    break
-                    
+        # 如果封面不在 spine 中，但我们在 manifest 中找到了它，手动将其加入
+        if not cover_img and cover_img_href:
+            cover_img_abs = os.path.normpath(os.path.join(tmp, opf_dir, cover_img_href))
+            if os.path.exists(cover_img_abs):
+                cover_img = (cover_img_abs, cover_img_href)
+                
+        # 最终顺序：封面（若有） + 其他图片
         final_images = []
         if cover_img:
             final_images.append(cover_img)
@@ -444,6 +455,7 @@ def epub_to_cbz(epub_path):
         counter = 1
         for idx, (img_abs, img_href) in enumerate(final_images):
             if idx == 0 and cover_img is not None:
+                # 封面保留原文件名
                 dest_name = os.path.basename(img_href)
             else:
                 ext = os.path.splitext(img_href)[1]
